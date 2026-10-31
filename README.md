@@ -43,7 +43,8 @@ Claude / any MCP client
 Cloudflare Worker  ──►  /mcp   (MCP server, Zod-validated tools)
         │
         ├──► Binance Spot public REST API (primary)
-        └──► CoinGecko (price-only fallback if Binance is geo-blocked, HTTP 451)
+        ├──► Binance.US (same API; automatic failover for US-based callers)
+        └──► CoinGecko (price-only, last resort)
 ```
 
 **Tech stack:** TypeScript · Cloudflare Workers · `@modelcontextprotocol/server` · Cloudflare `agents` MCP handler · Zod
@@ -51,7 +52,7 @@ Cloudflare Worker  ──►  /mcp   (MCP server, Zod-validated tools)
 **Engineering highlights**
 - Strict input validation on every tool: symbol format, interval enum and limit ranges.
 - Parallel upstream requests, so a full four-timeframe analysis finishes in about 2 seconds.
-- Graceful degradation: if Binance geo-blocks the request, the server falls back to CoinGecko and labels the result as reduced. It never fabricates data.
+- Geo-aware failover: Binance blocks US callers (HTTP 451), including Claude.ai's servers. The worker automatically retries on Binance.US, which uses the same API, so all tools keep working. Every response says which exchange served it, and the server never fabricates data.
 - Clear error reporting. An invalid symbol is returned as a proper MCP tool error.
 - CORS and host allow-listing, so browser-based MCP clients can connect.
 

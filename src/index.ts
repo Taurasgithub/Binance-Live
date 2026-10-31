@@ -2,7 +2,26 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
-const BINANCE_API = "https://api-gcp.binance.com";
+// Tried in order. If a host is geo-blocked (HTTP 451/403) or unreachable, the
+// next one is tried.
+//
+// Cloudflare forwards the original caller's country with outbound requests, so
+// Binance geo-blocks based on where the *MCP client* is, not where the Worker
+// runs. Claude.ai calls from the US, where binance.com returns 451, so
+// Binance.US (identical API format) is the fallback. Responses served by it are
+// labelled with `source: "Binance.US"`.
+// (api.binance.com / data-api.binance.vision reject Cloudflare Workers with 403.)
+const BINANCE_HOSTS = [
+  "https://api-gcp.binance.com",
+  "https://api.binance.us",
+];
+
+const BINANCE_US_HOST = "https://api.binance.us";
+
+const isGeoBlocked = (status: number, body: string) =>
+  status === 451 ||
+  status === 403 ||
+  /restricted location|service unavailable/i.test(body);
 
 const COINGECKO_SYMBOLS: Record<string, string> = {
   BTCUSDT: "bitcoin",
@@ -74,29 +93,52 @@ async function binanceRequest(
   path: string,
   params: Record<string, string | number | undefined> = {},
 ) {
-  const url = new URL(path, BINANCE_API);
+  let response: Response | null = null;
+  let text = "";
+  let servedBy = "";
+  let lastNetworkError: unknown = null;
 
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined) {
-      url.searchParams.set(key, String(value));
+  for (const host of BINANCE_HOSTS) {
+    servedBy = host;
+    const url = new URL(path, host);
+
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined) {
+        url.searchParams.set(key, String(value));
+      }
+    }
+
+    try {
+      response = await fetch(url.toString(), {
+        headers: { Accept: "application/json" },
+      });
+      text = await response.text();
+    } catch (error) {
+      lastNetworkError = error;
+      response = null;
+      continue;
+    }
+
+    // Success or a genuine client error (e.g. invalid symbol): stop here.
+    if (!isGeoBlocked(response.status, text) && response.status < 500) {
+      break;
     }
   }
 
-  const response = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/json",
-    },
-  });
-
-  const text = await response.text();
+  if (!response) {
+    throw new Error(
+      `Binance API unreachable: ${
+        lastNetworkError instanceof Error
+          ? lastNetworkError.message
+          : "network error"
+      }`,
+    );
+  }
 
   if (!response.ok) {
     const message = `Binance API error ${response.status}: ${text.slice(0, 500)}`;
 
-    if (
-      response.status === 451 ||
-      /restricted location|service unavailable/i.test(text)
-    ) {
+    if (isGeoBlocked(response.status, text)) {
       const fallback = await coingeckoFallbackForSymbol(
         params.symbol as string | undefined,
       );
@@ -112,11 +154,24 @@ async function binanceRequest(
     throw new Error(message);
   }
 
+  let data: unknown;
   try {
-    return JSON.parse(text);
+    data = JSON.parse(text);
   } catch {
     throw new Error("Binance returned invalid JSON.");
   }
+
+  // Label Binance.US responses so prices are never mistaken for binance.com.
+  if (
+    servedBy === BINANCE_US_HOST &&
+    data !== null &&
+    typeof data === "object" &&
+    !Array.isArray(data)
+  ) {
+    return { ...(data as Record<string, unknown>), source: "Binance.US" };
+  }
+
+  return data;
 }
 
 async function coingeckoFallbackForSymbol(symbol?: string) {
@@ -1350,7 +1405,10 @@ async function runTradeAnalysis(
 
       timestamp: new Date().toISOString(),
 
-      dataSource: "Binance Spot public API via Cloudflare Worker",
+      dataSource:
+        ticker.source === "Binance.US"
+          ? "Binance.US Spot public API (binance.com is geo-restricted for this caller)"
+          : "Binance Spot public API via Cloudflare Worker",
 
       readOnly: true,
 
@@ -1547,7 +1605,7 @@ async function runTradeAnalysis(
 
     // Only geo-restriction gets the reduced fallback evaluation. Anything else
     // (invalid symbol, network failure, etc.) surfaces as a real tool error.
-    if (!/error 451|restricted location|service unavailable/i.test(reason)) {
+    if (!/error 451|error 403|restricted location|service unavailable/i.test(reason)) {
       throw error;
     }
 
@@ -2059,6 +2117,39 @@ export default {
           },
         );
       }
+    }
+
+    /* ----------------------------------------------------------
+       DEBUG HOSTS — reachability of each Binance host from here
+       ---------------------------------------------------------- */
+
+    if (url.pathname === "/debug/hosts") {
+      const results = await Promise.all(
+        BINANCE_HOSTS.map(async (host) => {
+          try {
+            const r = await fetch(`${host}/api/v3/ticker/price?symbol=BTCUSDT`);
+            return { host, status: r.status };
+          } catch (error) {
+            return {
+              host,
+              status: "network-error",
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        }),
+      );
+      const trace = await fetch("https://www.cloudflare.com/cdn-cgi/trace")
+        .then((r) => r.text())
+        .catch(() => "");
+      const egress = Object.fromEntries(
+        trace
+          .split("\n")
+          .filter((l) => /^(colo|loc|ip)=/.test(l))
+          .map((l) => l.split("=") as [string, string]),
+      );
+      return new Response(JSON.stringify({ egress, results }, null, 2), {
+        headers: { "content-type": "application/json" },
+      });
     }
 
     /* ----------------------------------------------------------
