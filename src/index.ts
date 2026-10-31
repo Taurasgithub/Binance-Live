@@ -119,16 +119,6 @@ async function binanceRequest(
   }
 }
 
-const REFERENCE_PRICES: Record<string, { price: number; change24h: number }> = {
-  BTCUSDT: { price: 42500, change24h: 2.5 },
-  ETHUSDT: { price: 2300, change24h: 1.8 },
-  SOLUSDT: { price: 145, change24h: 3.2 },
-  BNBUSDT: { price: 610, change24h: 0.5 },
-  XRPUSDT: { price: 2.1, change24h: -0.8 },
-  ADAUSDT: { price: 0.98, change24h: 1.2 },
-  DOGEUSDT: { price: 0.38, change24h: 2.1 },
-};
-
 async function coingeckoFallbackForSymbol(symbol?: string) {
   if (!symbol) {
     return null;
@@ -167,20 +157,8 @@ async function coingeckoFallbackForSymbol(symbol?: string) {
         };
       }
     }
-  } catch (e) {
-    // CoinGecko failed, fall through to reference prices
-  }
-
-  // Last resort: use reference prices
-  if (symbol in REFERENCE_PRICES) {
-    const ref = REFERENCE_PRICES[symbol];
-    return {
-      symbol,
-      price: ref.price,
-      change24hPercent: ref.change24h,
-      volume24h: 0,
-      source: "reference-prices-fallback",
-    };
+  } catch {
+    // CoinGecko unavailable; never return stale or fabricated prices.
   }
 
   return null;
@@ -449,38 +427,32 @@ async function runTradeAnalysis(
        DATA
        ---------------------------------------------------------- */
 
-    const entryCandles = (await binanceRequest("/api/v3/klines", {
-      symbol,
-      interval: entryInterval,
-      limit: 250,
-    })) as Candle[];
+    const klines = (interval: Interval) =>
+      binanceRequest("/api/v3/klines", { symbol, interval, limit: 250 });
 
-    const confirmationCandles = (await binanceRequest("/api/v3/klines", {
-      symbol,
-      interval: confirmationInterval,
-      limit: 250,
-    })) as Candle[];
+    // Fetch all market data in parallel to minimise latency.
+    const [
+      entryRaw,
+      confirmationRaw,
+      trendRaw,
+      higherRaw,
+      tickerRaw,
+      orderBookRaw,
+    ] = await Promise.all([
+      klines(entryInterval),
+      klines(confirmationInterval),
+      klines(trendInterval),
+      klines(higherInterval),
+      binanceRequest("/api/v3/ticker/24hr", { symbol }),
+      binanceRequest("/api/v3/depth", { symbol, limit: 20 }),
+    ]);
 
-    const trendCandles = (await binanceRequest("/api/v3/klines", {
-      symbol,
-      interval: trendInterval,
-      limit: 250,
-    })) as Candle[];
-
-    const higherCandles = (await binanceRequest("/api/v3/klines", {
-      symbol,
-      interval: higherInterval,
-      limit: 250,
-    })) as Candle[];
-
-    const ticker = (await binanceRequest("/api/v3/ticker/24hr", {
-      symbol,
-    })) as Record<string, unknown>;
-
-    const orderBook = (await binanceRequest("/api/v3/depth", {
-      symbol,
-      limit: 20,
-    })) as {
+    const entryCandles = entryRaw as Candle[];
+    const confirmationCandles = confirmationRaw as Candle[];
+    const trendCandles = trendRaw as Candle[];
+    const higherCandles = higherRaw as Candle[];
+    const ticker = tickerRaw as Record<string, unknown>;
+    const orderBook = orderBookRaw as {
       bids?: string[][];
       asks?: string[][];
     };
@@ -518,7 +490,7 @@ async function runTradeAnalysis(
           confidencePercent: 15,
           status: "BINANCE_RESTRICTED",
           exactEvaluation:
-            "Binance public API is geo-restricted from this environment (HTTP 451 / restricted location). Technical analysis is unavailable. The system has attempted CoinGecko fallback and reference price data. Full multi-timeframe analysis requires unrestricted Binance access.",
+            "Binance public API is geo-restricted from this environment (HTTP 451 / restricted location). Technical analysis is unavailable. The system has attempted a CoinGecko price fallback. Full multi-timeframe analysis requires unrestricted Binance access.",
           reason: "Binance returned HTTP 451 or a restricted-location error.",
         },
         market: fallbackData
@@ -559,7 +531,7 @@ async function runTradeAnalysis(
           "The MCP connector is operational, but upstream Binance API is geo-blocked from this environment.",
           fallbackData
             ? `A fallback price (${fallbackData.source}) is available: $${fallbackData.price} (${fallbackData.change24hPercent}% 24h), but this does not provide technical indicators (EMA, RSI, MACD, etc.).`
-            : "No fallback market data was available from CoinGecko or reference prices.",
+            : "No fallback market data was available from CoinGecko.",
           "This is an infrastructure limitation, not a market signal.",
         ],
         disclaimer:
@@ -1570,10 +1542,16 @@ async function runTradeAnalysis(
         "Technical analysis is probabilistic and not financial advice. This read-only tool does not execute trades.",
     };
   } catch (error) {
-    const fallback = await coingeckoFallbackForSymbol(symbol);
-
     const reason =
       error instanceof Error ? error.message : "Unknown Binance API error.";
+
+    // Only geo-restriction gets the reduced fallback evaluation. Anything else
+    // (invalid symbol, network failure, etc.) surfaces as a real tool error.
+    if (!/error 451|restricted location|service unavailable/i.test(reason)) {
+      throw error;
+    }
+
+    const fallback = await coingeckoFallbackForSymbol(symbol);
 
     return {
       tool: "binance_trade_analysis",
@@ -1629,7 +1607,7 @@ async function runTradeAnalysis(
         "The MCP connector is operational, but upstream Binance API is geo-blocked from this environment.",
         fallback
           ? `A fallback price (${fallback.source}) is available: $${fallback.price} (${fallback.change24hPercent}% 24h), but this does not provide technical indicators (EMA, RSI, MACD, etc.).`
-          : "No fallback market data was available from CoinGecko or reference prices.",
+          : "No fallback market data was available from CoinGecko.",
         "This is an infrastructure limitation, not a market signal.",
       ],
       disclaimer:
